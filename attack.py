@@ -15,12 +15,12 @@ def process_file(file_index):
     input_filename = f'datasets/Attack/test{file_index}.json'
     output_filename = f'datasets/Attack/test{file_index}_output.json'
     
-    print(f"[线程-{file_index}] 开始处理 {input_filename}")
+    print(f"[-{file_index}] processing {input_filename}")
     
     with open(input_filename, 'r', encoding='utf-8') as f:
         data = json.load(f)
     
-    print(f"[线程-{file_index}] 共 {len(data)} 条数据")
+    print(f"[{file_index}] total {len(data)} datas")
     
     res = []
     
@@ -52,7 +52,6 @@ for i in range(10):
 for t in threads:
     t.join()
 
-print("全部处理完成！输出: test0_output.json ~ test9_output.json")
 
 
 import json
@@ -60,20 +59,17 @@ import random
 import nltk
 from tqdm import tqdm
 
-# 确保下载 NLTK 的分句模型
 try:
     nltk.data.find('tokenizers/punkt')
 except LookupError:
     nltk.download('punkt')
 
 def process_text(text_str, swap_threshold=20):
-    """
-    对单个 text 字符串进行随机单词交换处理
-    """
+
     if not text_str:
         return text_str
 
-    # 按换行符分割
+
     lines = text_str.split('\n')
     new_lines = []
     
@@ -82,12 +78,11 @@ def process_text(text_str, swap_threshold=20):
         if len(line) == 0:
             new_lines.append(line)
         else:
-            # 分句
+
             sents = nltk.sent_tokenize(line)
             new_sents = []
             for sent in sents:
-                words = sent.split()
-                # 仅对长句进行扰动
+
                 if len(words) > swap_threshold:
                     idx = random.randint(0, len(words) - 2)
                     words[idx], words[idx+1] = words[idx+1], words[idx]
@@ -97,43 +92,38 @@ def process_text(text_str, swap_threshold=20):
     return '\n'.join(new_lines)
 
 def main():
-    # 配置文件路径
-    input_file = "input.json"      # 替换为你的输入文件名
-    output_file = "output.json"    # 替换为你的输出文件名
-    swap_threshold = 20            # 可调整的交换阈值
 
-    # 1. 读取 JSON 文件
-    print(f"🔍 正在读取 {input_file}...")
+    input_file = ""      
+    output_file = ""    
+    swap_threshold = 20            
+
+
+    print(f"read {input_file}...")
     with open(input_file, 'r', encoding='utf-8') as f:
         data = json.load(f)
     
-    print(f"📊 成功读取 {len(data)} 条数据")
+    print(f"successfully {len(data)} datas")
 
-    # 2. 处理数据
-    print("⚡ 正在处理 'text' 字段...")
+
     processed_data = []
     
     for item in tqdm(data, desc="Processing"):
-        # 获取原始 'text' 和 'result'
         text_val = item.get("text", "")
-        result_val = item.get("result", "") # 'result' 是标签，保持不变
+        result_val = item.get("result", "") 
         
-        # 处理 'text' 字段
+
         new_text = process_text(text_val, swap_threshold)
         
-        # 构造新条目，'text' 已更新，'result' 不变
+
         new_item = {
             "text": new_text,
-            "result": result_val # 'result' 作为标签，原样保留
+            "result": result_val 
         }
         processed_data.append(new_item)
 
-    # 3. 保存到新 JSON 文件
-    print(f"💾 正在保存结果到 {output_file}...")
     with open(output_file, 'w', encoding='utf-8') as f:
         json.dump(processed_data, f, ensure_ascii=False, indent=2)
     
-    print("🎉 处理完成！")
 
 if __name__ == "__main__":
     main()
