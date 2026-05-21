@@ -1,7 +1,7 @@
 import torch
 from torch.utils.data import DataLoader
 from transformers import AutoModel
-from models.models import BiLSTM_RGCN
+from models.models import SSD
 from utils.data_loader import TextDataset
 import torch.nn as nn
 from tqdm import tqdm
@@ -83,9 +83,6 @@ def evaluate(model, bert_model, dataloader, device, save_alpha_path=None):
 
 
 def load_and_evaluate(args):
-    """
-    加载模型并在测试集上评估
-    """
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Using device: {device}")
 
@@ -107,7 +104,7 @@ def load_and_evaluate(args):
 
     # dep_list = list(train_dataset.dep2idx.keys())
     dep_list = list(dep_list.keys())
-    model = BiLSTM_RGCN(
+    model = SSD(
         input_dim=args.input_dim,
         hidden_dim=args.hidden_dim,
         rgcn_hidden_dim=args.rgcn_hidden_dim,
@@ -119,7 +116,7 @@ def load_and_evaluate(args):
     ).to(device)
     
     best_model_path = os.path.join(args.save_dir, 'best_model.pt')
-    assert os.path.exists(best_model_path), f"未找到模型权重文件：{best_model_path}"
+    assert os.path.exists(best_model_path), f"Model weight file not found: {best_model_path}"
 
     state_dict = torch.load(best_model_path, map_location=device)
 

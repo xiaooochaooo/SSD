@@ -2,7 +2,7 @@ import torch
 from utils.data_loader import TextDataset
 from torch.utils.data import DataLoader
 from transformers import AutoModel
-from models.models import BiLSTM_RGCN
+from models.models import SSD
 import torch.nn as nn
 import torch.optim as optim
 import os
@@ -17,7 +17,7 @@ def evaluate(model, bert_model, dataloader, device):
     Evaluate model performance on validation or test set.
     
     Args:
-        model: BiLSTM_RGCN model instance
+        model: SSD model instance
         bert_model: Pretrained BERT model for embeddings
         dataloader: DataLoader for evaluation data
         device: Device to run evaluation on
@@ -83,7 +83,7 @@ def evaluate(model, bert_model, dataloader, device):
 
 def train(args):
     """
-    Main training function for BiLSTM-RGCN model.
+    Main training function for SSD model.
     
     Handles:
     - Dataset loading and preprocessing
@@ -119,7 +119,7 @@ def train(args):
         param.requires_grad = False
 
     # Initialize BiLSTM-RGCN model
-    model = BiLSTM_RGCN(
+    model = SSD(
         input_dim=args.input_dim,
         hidden_dim=args.hidden_dim,
         rgcn_hidden_dim=args.rgcn_hidden_dim,
@@ -247,7 +247,7 @@ def test_best_model(args, bert_model, device, test_loader):
     with open('./checkpoints/dep2idx.json', 'r', encoding='utf-8') as f:
             dep_list = json.load(f)
     # dep_list = list(test_loader.dataset.dep2idx.keys())
-    model = BiLSTM_RGCN(
+    model = SSD(
         input_dim=args.input_dim,
         hidden_dim=args.hidden_dim,
         rgcn_hidden_dim=args.rgcn_hidden_dim,
@@ -264,7 +264,6 @@ def test_best_model(args, bert_model, device, test_loader):
     if torch.cuda.device_count() > 1:
         print(f"Using {torch.cuda.device_count()} GPUs for testing!")
         model = nn.DataParallel(model)
-        # 判断是否需要去掉 module. 前缀
         new_state_dict = {}
         for k, v in state_dict.items():
             if k.startswith('module.'):
@@ -286,7 +285,7 @@ def test_best_model(args, bert_model, device, test_loader):
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Train BiLSTM+GCN for LLM-Generated Text Detection')
+    parser = argparse.ArgumentParser(description='Train SSD for LLM-Generated Text Detection')
 
     parser.add_argument('--train_path', type = str, default = 'datasets/train.pt', help = 'Path to training dataset')
     parser.add_argument('--val_path', type = str, default = 'datasets/val.pt', help = 'Path to validation dataset')

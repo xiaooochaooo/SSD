@@ -24,9 +24,9 @@ def process_file(file_index):
     
     res = []
     
-    for idx, item in enumerate(tqdm(data, desc=f"线程-{file_index}", position=file_index)):
+    for idx, item in enumerate(tqdm(data, desc=f"thread-{file_index}", position=file_index)):
         response = ds.invoke(
-            f"重写下面的文本，只输出重写的部分不输出额外部分,语言为英文:{item['text']}"
+            f"Rewrite the following text, output only the rewritten part without additional content, in English:{item['text']}"
         )
         res.append({
             "text": response.content.strip(),
@@ -36,12 +36,12 @@ def process_file(file_index):
         if (idx + 1) % 50 == 0:
             with open(output_filename, 'w', encoding='utf-8') as f:
                 json.dump(res, f, ensure_ascii=False, indent=4)
-            print(f"[线程-{file_index}] 已保存 {idx + 1} 条")
+            print(f"[thread-{file_index}]: {idx + 1}")
     
     with open(output_filename, 'w', encoding='utf-8') as f:
         json.dump(res, f, ensure_ascii=False, indent=4)
     
-    print(f"[线程-{file_index}] 完成，共 {len(res)} 条")
+    print(f"[thread-{file_index}]: {len(res)} ")
 
 threads = []
 for i in range(10):
