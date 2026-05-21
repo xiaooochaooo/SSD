@@ -83,14 +83,13 @@ class StructureSemanticDiscrepancyAttention(nn.Module):
         return sent_vec, attn_weights , avg_diff_scalar_per_sample, decouple_loss
 
 
-class BiLSTM_RGCN(nn.Module):
+class SSD(nn.Module):
     '''
-    BiLSTM with Relational Graph Convolutional Network for text classification.
+    SSD for text classification.
 
     This model combines:
     - BiLSTM for sequential text encoding.
     - RGCN for depedency graph structure processing
-    - POS tag embeddings for linguistic features
 
     Args:
         - input_dim(int): Dimension of input word embeddings
@@ -113,7 +112,7 @@ class BiLSTM_RGCN(nn.Module):
                 dropout=0.5, 
                 dep_list=None, 
                 max_seq_len=512):
-        super(BiLSTM_RGCN, self).__init__()
+        super(SSD, self).__init__()
         self.max_seq_len = max_seq_len
 
         # Bidirectional LSTM for sequence encoding
@@ -158,7 +157,7 @@ class BiLSTM_RGCN(nn.Module):
 
     def forward(self, x, TPS, adj, edge_type=None, mask=None):
         '''
-        Forward pass of the BiLSTM-RGCN model.
+        Forward pass of the SSD model.
 
         Args:
             - x(Tensor): Input word embeddings [batch_size, seq_len, input_dim]
@@ -234,7 +233,7 @@ class BiLSTM_RGCN(nn.Module):
         # with open('llmD-T-sne.csv', "a", newline="", encoding="utf-8") as f:
         #     writer = csv.writer(f)
         #     for i in range(batch_size):
-        #         # 将 [seq_len, hidden_dim] 
+        #         # [seq_len, hidden_dim] 
         #         diff_feat_i = alpha[i].cpu().numpy().reshape(-1).tolist()
         #         writer.writerow(diff_feat_i)
 
@@ -264,7 +263,7 @@ if __name__ == "__main__":
     adj = torch.randint(0,2,(batch_size, seq_len, seq_len))
     edge_type = torch.randint(0,3,(batch_size, seq_len, seq_len))
 
-    model = BiLSTM_RGCN(input_dim, hidden_dim, rgcn_hidden_dim, n_classes, dep_list=['dep1','dep2','dep3'])
+    model = SSD(input_dim, hidden_dim, rgcn_hidden_dim, n_classes, dep_list=['dep1','dep2','dep3'])
     logits = model(x, adj, edge_type=edge_type)
     print("logits shape:", logits.shape)
 
@@ -280,7 +279,6 @@ class CrossViewCrossAttention(nn.Module):
         self.seq_proj = nn.Linear(seq_dim, hidden_dim)
         self.struct_proj = nn.Linear(struct_dim, hidden_dim)
 
-        # 传统交叉注意力：Q来自一个模态，K,V来自另一个模态
         self.W_q = nn.Linear(hidden_dim, hidden_dim)  # Query
         self.W_k = nn.Linear(hidden_dim, hidden_dim)  # Key
         self.W_v = nn.Linear(hidden_dim, hidden_dim)  # Value
@@ -298,7 +296,6 @@ class CrossViewCrossAttention(nn.Module):
         batch_size, seq_len, _ = x_seq.size()
         _, struct_len, _ = x_struct.size()
 
-        # 分别投影两个模态
         h_seq = self.seq_proj(x_seq)           # [B, L_seq, H]
         h_struct = self.struct_proj(x_struct)  # [B, L_struct, H]
 
