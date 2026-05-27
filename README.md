@@ -1,4 +1,4 @@
-# SSD: Structure-Semantic Discrepancy for LLM-Generated Text Detection
+# Beyond Surface Fluency: Domain-Robust LLM-Generated Text Detection via Sequential-Structural Discrepancy
 
 <img src="images/framework.png" width="1000px">
 
