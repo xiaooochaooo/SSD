@@ -17,7 +17,7 @@
 
 We introduce **SSD (Structure-Semantic Discrepancy)**, a novel model for detecting LLM-generated text. Unlike traditional methods that rely solely on semantic features, SSD jointly leverages **sequential semantics** (via BiLSTM) and **syntactic structure** (via Relational Graph Convolution Networks over dependency parse trees) to capture the discrepancy between human-written and machine-generated text.
 
-The core innovation is the **Structure-Semantic Discrepancy Attention** mechanism, which:
+The core innovation is the **SSD**, which:
 
 - Encodes sequential context using a **BiLSTM** encoder
 - Models syntactic dependencies using a **2-layer RGCN** over dependency parse graphs
