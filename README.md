@@ -143,7 +143,7 @@ To evaluate a trained model on a test set:
 
 ```bash
 python evaluate.py \
-  --test_path datasets/L2R/L2R_llm.pt \
+  --test_path datasets/AcademicResearch/test.pt \
   --tokenizer ./models/roberta-base \
   --max_len 512 \
   --input_dim 768 \
