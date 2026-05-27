@@ -28,7 +28,7 @@ Additionally, we provide an **adversarial attack pipeline** that tests model rob
 
 ## Environment
 
-- **Ubuntu 20.04 **
+- **Ubuntu 20.04**
 - **CUDA**: 12.6 (recommended)
 - **Python**: 3.10
 
