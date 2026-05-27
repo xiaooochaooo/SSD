@@ -29,7 +29,7 @@ Attack.
 
 ## Environment
 
-- **Ubuntu 20.04 **
+- **Ubuntu 20.04**
 - **CUDA**: 12.6
 - **Python**: 3.10
 
