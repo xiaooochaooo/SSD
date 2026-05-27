@@ -29,7 +29,7 @@ Additionally, we provide an **adversarial attack pipeline** that tests model rob
 ## Environment
 
 - **Ubuntu 20.04**
-- **CUDA**: 12.6 (recommended)
+- **CUDA**: 12.6
 - **Python**: 3.10
 
 We recommend using Anaconda to set up the environment:
