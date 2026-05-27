@@ -1,4 +1,4 @@
-# Beyond Surface Fluency: Domain-Robust LLM-Generated Text Detection via Sequential-Structural Discrepancy
+# SSD: Structure-Semantic Discrepancy for LLM-Generated Text Detection
 
 <img src="images/framework.png" width="1000px">
 
@@ -17,18 +17,19 @@
 
 We introduce **SSD (Structure-Semantic Discrepancy)**, a novel model for detecting LLM-generated text. Unlike traditional methods that rely solely on semantic features, SSD jointly leverages **sequential semantics** (via BiLSTM) and **syntactic structure** (via Relational Graph Convolution Networks over dependency parse trees) to capture the discrepancy between human-written and machine-generated text.
 
-The core innovation is the **SSD**, which:
+The core innovation is the **SSD** mechanism, which:
 
-- Encodes sequential context using a **BiLSTM** encoder
-- Models syntactic dependencies using a **2-layer RGCN** over dependency parse graphs
+- Encodes sequential context using a **BiLSTM** (or other) encoder
+- Models syntactic dependencies using a **RGCN** over dependency parse graphs
 - Computes a **gated fusion** between semantic and structural features to highlight their discrepancy
-- Applies **multi-head cross-attention** to produce a sentence-level representation for binary classification (Human vs. LLM-generated)
+- Applies **Discrepancy-Based Classification** to produce a sentence-level representation for binary classification (Human vs. LLM-generated)
 
-Additionally, we provide an **adversarial attack pipeline** that tests model robustness through LLM-based rewriting and word-order perturbation.
+Additionally, we provide an **adversarial attack pipeline** that tests model robustness through rewrite attack and Decoherence
+Attack.
 
 ## Environment
 
-- **Ubuntu 20.04**
+- **Ubuntu 20.04 **
 - **CUDA**: 12.6
 - **Python**: 3.10
 
@@ -143,7 +144,7 @@ To evaluate a trained model on a test set:
 
 ```bash
 python evaluate.py \
-  --test_path datasets/AcademicResearch/test.pt \
+  --test_path datasets/L2R/L2R_llm.pt \
   --tokenizer ./models/roberta-base \
   --max_len 512 \
   --input_dim 768 \
