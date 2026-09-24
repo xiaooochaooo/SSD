@@ -28,7 +28,7 @@ After pretraining, the view encoders are frozen for the main detector. For token
 $$
 \mathbf{D}_i = |\mathbf{h}^{seq}_i-\mathbf{h}^{str}_i|,
 \qquad
-d_i = \operatorname{mean}(\mathbf{D}_i).
+d_i = \mathrm{mean}(\mathbf{D}_i).
 $$
 
 The fixed discrepancy feature guides token-level view fusion. The fused representation is concatenated with the token proxy score (TPS), processed by multi-head self-attention, max-pooled, and classified as human-written or LLM-generated text.
