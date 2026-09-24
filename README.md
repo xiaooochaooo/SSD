@@ -23,13 +23,13 @@ SSD represents each token from two complementary views:
 
 The two encoders are first pretrained on an unlabeled corpus. For randomly masked tokens, each branch independently predicts the same frozen RoBERTa target representation. Human/LLM labels, provenance labels, a detector classifier, and cross-view contrastive negatives are not used during this stage.
 
-After pretraining, the view encoders are frozen for the main detector. For token (i), SSD computes
+After pretraining, the view encoders are frozen for the main detector. For token $i$, SSD computes
 
-\[
+$$
 \mathbf{D}_i = |\mathbf{h}^{seq}_i-\mathbf{h}^{str}_i|,
 \qquad
 d_i = \operatorname{mean}(\mathbf{D}_i).
-\]
+$$
 
 The fixed discrepancy feature guides token-level view fusion. The fused representation is concatenated with the token proxy score (TPS), processed by multi-head self-attention, max-pooled, and classified as human-written or LLM-generated text.
 
