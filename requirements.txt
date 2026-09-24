@@ -1,0 +1,9 @@
+numpy
+torch
+torch-geometric
+transformers
+datasets
+scikit-learn
+spacy
+tqdm
+langchain-openai
