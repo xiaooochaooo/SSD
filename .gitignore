@@ -4,7 +4,7 @@ __pycache__/
 .idea/
 .vscode/
 
-datasets/
+
 logs/
 results/
 result/
@@ -13,7 +13,6 @@ models/roberta-base/
 models/Qwen3/
 models/Qwen3-4B/
 
-checkpoints/*
 !checkpoints/dep2idx.json
 
 *.pt
