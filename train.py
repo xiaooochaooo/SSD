@@ -1,314 +1,549 @@
-import torch
-from utils.data_loader import TextDataset
-from torch.utils.data import DataLoader
-from transformers import AutoModel
-from models.models import SSD
-import torch.nn as nn
-import torch.optim as optim
-import os
-from tqdm import tqdm
 import argparse
-from sklearn.metrics import accuracy_score, auc, f1_score, recall_score, precision_score, roc_auc_score
 import json
+import math
+import os
+import random
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from sklearn.metrics import (
+    accuracy_score,
+    f1_score,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+
+from models.models import (
+    FrozenPretrainedBiViewDetector,
+    FrozenPretrainedSingleViewDetector,
+)
+from utils.data_loader import TextDataset
 
 
-def evaluate(model, bert_model, dataloader, device):
-    """
-    Evaluate model performance on validation or test set.
-    
-    Args:
-        model: SSD model instance
-        bert_model: Pretrained BERT model for embeddings
-        dataloader: DataLoader for evaluation data
-        device: Device to run evaluation on
-    
-    Returns:
-        dict: Dictionary containing evaluation metrics
-    """
-    model.eval()
-    all_preds, all_labels, all_probs = [], [], []
-    total_loss = 0.0
-    total_cls_loss = 0.0
-    total_dec_loss = 0.0
-    criterion = nn.CrossEntropyLoss()
-
-    with torch.no_grad():
-        for batch in tqdm(dataloader, ncols = 100):
-            input_ids = batch['input_ids'].to(device)
-            attention_mask = batch['attention_mask'].to(device)
-            adj = batch['adj'].to(device)
-            edge_type = batch['edge_type'].to(device)
-            labels = batch['label'].to(device)
-            TPS = batch['TPS'].to(device)
+def set_seed(seed):
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
 
-            embeddings = bert_model(input_ids, attention_mask=attention_mask).last_hidden_state
-            logits, decouple_loss= model(embeddings, TPS, adj, edge_type=edge_type, mask=attention_mask)
-            decouple_loss = decouple_loss.mean()  
-            loss_cls = criterion(logits, labels)
-            loss = loss_cls+ 1.0*decouple_loss
-
-            total_loss += loss.item()
-            total_cls_loss += loss_cls.item()
-            total_dec_loss += decouple_loss.item()
-
-            probs = torch.softmax(logits, dim = -1)[:, -1]
-            preds = torch.argmax(logits, dim = -1)
-
-            all_probs.extend(probs.cpu().tolist())
-            all_preds.extend(preds.cpu().tolist())
-            all_labels.extend(labels.cpu().tolist())
-            
-    avg_loss = total_loss / len(dataloader)
-    avg_cls_loss = total_cls_loss / len(dataloader)
-    avg_dec_loss = total_dec_loss / len(dataloader)
-    acc = accuracy_score(all_labels, all_preds)
-    f1 = f1_score(all_labels, all_preds, average='macro')
-    recall = recall_score(all_labels , all_preds, average='macro')
-    precision = precision_score(all_labels, all_preds, average='macro')
-    auroc = roc_auc_score(all_labels, all_probs)
-
-    return{
-        'loss': avg_loss,
-        'cls_loss': avg_cls_loss,
-        'dec_loss': avg_dec_loss,
-        'accuracy': acc,
-        'precision': precision,
-        'recall': recall,
-        'f1': f1,
-        'auroc': auroc
+def move_batch(batch, device):
+    return {
+        key: value.to(device, non_blocking=(device.type == "cuda"))
+        if torch.is_tensor(value) else value
+        for key, value in batch.items()
     }
 
 
+def compute_metrics(labels, predictions, scores):
+    metrics = {
+        "accuracy": accuracy_score(labels, predictions),
+        "precision": precision_score(
+            labels, predictions, average="macro", zero_division=0
+        ),
+        "recall": recall_score(
+            labels, predictions, average="macro", zero_division=0
+        ),
+        "f1": f1_score(
+            labels, predictions, average="macro", zero_division=0
+        ),
+    }
+    metrics["auroc"] = (
+        roc_auc_score(labels, scores) if len(set(labels)) == 2 else 0.0
+    )
+    return metrics
+
+
+@torch.no_grad()
+def evaluate(model, dataloader, device, use_amp):
+    model.eval()
+    criterion = nn.CrossEntropyLoss()
+
+    total_loss = 0.0
+    total_examples = 0
+    total_diff = 0.0
+    total_cosine = 0.0
+    all_predictions = []
+    all_labels = []
+    all_scores = []
+
+    for batch in tqdm(dataloader, desc="Evaluating", ncols=100):
+        batch = move_batch(batch, device)
+        labels = batch["label"].long().view(-1)
+
+        with torch.amp.autocast(
+            device_type=device.type,
+            dtype=torch.float16,
+            enabled=use_amp,
+        ):
+            logits, _, avg_diff, cosine_metric = model(
+                input_ids=batch["input_ids"],
+                TPS=batch["TPS"],
+                adj=batch["adj"],
+                edge_type=batch["edge_type"],
+                mask=batch["attention_mask"],
+            )
+            loss = criterion(logits.float(), labels)
+
+        batch_size = labels.size(0)
+        probabilities = F.softmax(logits.float(), dim=-1)
+        predictions = logits.argmax(dim=-1)
+
+        total_loss += loss.item() * batch_size
+        total_examples += batch_size
+        total_diff += avg_diff.sum().item()
+        total_cosine += cosine_metric.item() * batch_size
+        all_predictions.extend(predictions.cpu().tolist())
+        all_labels.extend(labels.cpu().tolist())
+        all_scores.extend(probabilities[:, 1].cpu().tolist())
+
+    metrics = compute_metrics(all_labels, all_predictions, all_scores)
+    metrics["loss"] = total_loss / max(total_examples, 1)
+    if hasattr(model, "view_type"):
+        metrics["avg_view_norm"] = total_diff / max(total_examples, 1)
+    else:
+        metrics["avg_frozen_D"] = total_diff / max(total_examples, 1)
+        metrics["avg_frozen_abs_cosine"] = (
+            total_cosine / max(total_examples, 1)
+        )
+    return metrics
+
+
+def checkpoint_payload(
+    model,
+    args,
+    epoch,
+    best_auroc,
+    best_f1,
+    metrics,
+):
+    payload = {
+        "downstream_state_dict": model.downstream_state_dict(),
+        "args": vars(args),
+        "epoch": epoch,
+        "best_auroc": best_auroc,
+        "best_f1": best_f1,
+        "metrics": metrics,
+        "architecture": (
+            f"frozen_pretrained_{args.view_mode}_view_tps_attention"
+            if args.view_mode != "dual"
+            else (
+                "frozen_pretrained_biview_postfusion_tps"
+                if args.freeze_encoders
+                else "end_to_end_biview_postfusion_tps"
+            )
+        ),
+    }
+    if args.view_mode == "dual" and not args.freeze_encoders:
+        # RoBERTa stays frozen and is reloaded from its original path. Save the
+        # fine-tuned Transformer/RGCN layers so evaluation exactly reproduces
+        # the end-to-end model without duplicating RoBERTa in every checkpoint.
+        payload["encoder_state_dict"] = model.trainable_view_state_dict()
+    return payload
+
+
+def build_warmup_cosine_scheduler(
+    optimizer,
+    total_steps,
+    warmup_ratio,
+    min_lr,
+    base_lr,
+):
+    warmup_steps = int(total_steps * warmup_ratio)
+    decay_steps = max(total_steps - warmup_steps, 1)
+    min_lr_ratio = min_lr / base_lr
+
+    def lr_lambda(current_step):
+        if warmup_steps > 0 and current_step < warmup_steps:
+            return (current_step + 1) / warmup_steps
+
+        progress = (current_step - warmup_steps) / decay_steps
+        progress = min(max(progress, 0.0), 1.0)
+        cosine_scale = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return min_lr_ratio + (1.0 - min_lr_ratio) * cosine_scale
+
+    return torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        lr_lambda=lr_lambda,
+    ), warmup_steps
+
 
 def train(args):
-    """
-    Main training function for SSD model.
-    
-    Handles:
-    - Dataset loading and preprocessing
-    - Model initialization and training
-    - Validation and checkpointing
-    - Test set evaluation
-    
-    Args:
-        args: Command line arguments containing training configuration
-    """
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f'Using device: {device}')
+    set_seed(args.seed)
+    if not 0.0 <= args.label_smoothing < 1.0:
+        raise ValueError("label_smoothing must be in [0, 1)")
+    if not 0.0 <= args.warmup_ratio < 1.0:
+        raise ValueError("warmup_ratio must be in [0, 1)")
+    if not 0.0 <= args.min_lr <= args.lr:
+        raise ValueError("min_lr must be in [0, lr]")
 
-    # Load datasets and create data loaders
-    train_dataset = TextDataset(args.train_path)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    use_amp = args.amp and device.type == "cuda"
+    print(f"Using device: {device}")
 
-    # dep2idx = train_dataset.dep2idx
-    # pos2idx = train_dataset.pos2idx
-    with open('./checkpoints/dep2idx_stanza.json', 'r', encoding='utf-8') as f:
-            dep2idx = json.load(f)
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
+    train_dataset = TextDataset(args.train_path, mmap=args.mmap_data)
+    val_dataset = TextDataset(args.val_path, mmap=args.mmap_data)
 
-    val_dataset = TextDataset(args.val_path)
-    val_loader = DataLoader(val_dataset, batch_size = args.batch_size, shuffle=False)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=(device.type == "cuda"),
+        persistent_workers=(args.num_workers > 0),
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=(device.type == "cuda"),
+        persistent_workers=(args.num_workers > 0),
+    )
 
-    test_dataset = TextDataset(args.test_path)
-    test_loader = DataLoader(test_dataset, batch_size = args.batch_size, shuffle=False)
+    if args.view_mode == "dual":
+        model = FrozenPretrainedBiViewDetector(
+            seq_ckpt=args.seq_ckpt,
+            graph_ckpt=args.graph_ckpt,
+            roberta_name=args.roberta,
+            num_relations=args.num_relations,
+            num_class=args.num_class,
+            num_heads=args.num_heads,
+            dropout=args.dropout,
+            freeze_encoders=args.freeze_encoders,
+        ).to(device)
+        view_module = model.frozen_encoders
+    else:
+        if not args.freeze_encoders:
+            raise ValueError(
+                "Single-view ablations require frozen pretrained encoders"
+            )
+        model = FrozenPretrainedSingleViewDetector(
+            view_type=args.view_mode,
+            seq_ckpt=args.seq_ckpt if args.view_mode == "sequence" else None,
+            graph_ckpt=(
+                args.graph_ckpt if args.view_mode == "structure" else None
+            ),
+            roberta_name=args.roberta,
+            num_relations=args.num_relations,
+            num_class=args.num_class,
+            num_heads=args.num_heads,
+            dropout=args.dropout,
+        ).to(device)
+        view_module = model.frozen_encoder
+    model.train()
 
-    # Initialize BERT model for embeddings (frozen during training)
-    bert_model = AutoModel.from_pretrained(args.tokenizer).to(device) # type: ignore
-    bert_model.eval()
-    for param in bert_model.parameters():
-        param.requires_grad = False
+    frozen_parameters = sum(
+        parameter.numel()
+        for parameter in view_module.parameters()
+    )
+    trainable_parameters = sum(
+        parameter.numel()
+        for parameter in model.parameters()
+        if parameter.requires_grad
+    )
+    if args.view_mode != "dual" or args.freeze_encoders:
+        assert not any(
+            parameter.requires_grad
+            for parameter in view_module.parameters()
+        )
+    else:
+        assert any(
+            parameter.requires_grad
+            for parameter in view_module.parameters()
+        )
+        assert not any(
+            parameter.requires_grad
+            for parameter in model.frozen_encoders.seq_encoder.roberta.parameters()
+        )
+        assert not any(
+            parameter.requires_grad
+            for parameter in model.frozen_encoders.graph_encoder.roberta.parameters()
+        )
+    print(f"View mode: {args.view_mode}")
+    print(f"View encoders frozen: {args.freeze_encoders}")
+    print(f"Total view-encoder params: {frozen_parameters:,}")
+    print(f"Total trainable params: {trainable_parameters:,}")
+    print(f"AMP: {use_amp}")
+    print("Supervised loss: cross-entropy only")
+    print("D and absolute cosine are monitoring metrics only")
 
-    # Initialize BiLSTM-RGCN model
-    model = SSD(
-        input_dim=args.input_dim,
-        hidden_dim=args.hidden_dim,
-        rgcn_hidden_dim=args.rgcn_hidden_dim,
-        num_class=args.num_class,
-        lstm_layers=args.lstm_layers,
-        dropout=args.dropout,
-        dep_list=list(dep2idx.keys()),
-        max_seq_len=args.max_len
-    ).to(device)
+    optimizer = torch.optim.AdamW(
+        [
+            parameter
+            for parameter in model.parameters()
+            if parameter.requires_grad
+        ],
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+    )
+    total_steps = max(len(train_loader) * args.epochs, 1)
+    scheduler, warmup_steps = build_warmup_cosine_scheduler(
+        optimizer=optimizer,
+        total_steps=total_steps,
+        warmup_ratio=args.warmup_ratio,
+        min_lr=args.min_lr,
+        base_lr=args.lr,
+    )
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    criterion = nn.CrossEntropyLoss(
+        label_smoothing=args.label_smoothing
+    )
 
-    print(model)
-    for name, param in model.named_parameters():
-        print(f"{name}: shape={param.shape}, params={param.numel()}")
+    print(f"Label smoothing: {args.label_smoothing}")
+    print(
+        "LR schedule: "
+        f"{warmup_steps} warmup steps, cosine decay "
+        f"from {args.lr:.2e} to {args.min_lr:.2e}"
+    )
+    print(f"Save every epoch: {args.save_every_epoch}")
 
-    # Enable multi-GPU training if available
-    if torch.cuda.device_count() > 1:
-        print(f"Using {torch.cuda.device_count()} GPUs!")
-        model = nn.DataParallel(model)
-
-    # Initialize loss function and optimizer
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.AdamW(model.parameters(),lr=args.lr,weight_decay=args.weight_decay)
-    
-    # Create checkpoint directory
     os.makedirs(args.save_dir, exist_ok=True)
-
-    best_auc = 0.0
     log_path = os.path.join(args.save_dir, "training_log.jsonl")
-    
-    print('Training started...')
-    for epoch in range(1,args.epochs +1):
+    best_auroc = -1.0
+    best_f1 = -1.0
+    stat_key = (
+        "avg_frozen_D" if args.view_mode == "dual" else "avg_view_norm"
+    )
+    stat_label = "D" if args.view_mode == "dual" else "ViewNorm"
+
+    for epoch in range(1, args.epochs + 1):
         model.train()
         total_loss = 0.0
-        num_samples = 0
+        total_examples = 0
+        total_diff = 0.0
+        total_cosine = 0.0
+        correct = 0
 
-        # Training loop with progress bar
-        loop = tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs}",ncols=100)
-        for batch in loop:
-            input_ids = batch['input_ids'].to(device)
-            attention_mask = batch['attention_mask'].to(device)
-            adj = batch['adj'].to(device)
-            edge_type = batch['edge_type'].to(device)
-            labels = batch['label'].to(device)
-            TPS = batch['TPS'].to(device)
+        progress = tqdm(
+            train_loader,
+            desc=f"Epoch {epoch}/{args.epochs}",
+            ncols=120,
+        )
+        for batch in progress:
+            batch = move_batch(batch, device)
+            labels = batch["label"].long().view(-1)
+            optimizer.zero_grad(set_to_none=True)
 
-            batch_size = input_ids.size(0)
-            num_samples += batch_size
+            with torch.amp.autocast(
+                device_type=device.type,
+                dtype=torch.float16,
+                enabled=use_amp,
+            ):
+                logits, _, avg_diff, cosine_metric = model(
+                    input_ids=batch["input_ids"],
+                    TPS=batch["TPS"],
+                    adj=batch["adj"],
+                    edge_type=batch["edge_type"],
+                    mask=batch["attention_mask"],
+                )
+                # No decoupling term is added in either frozen or end-to-end
+                # mode, so the two ablations differ only in initialization and
+                # whether supervised gradients update the view encoders.
+                loss = criterion(logits.float(), labels)
 
-            # Get BERT embeddings (no gradient computation)
-            with torch.no_grad():
-                embeddings = bert_model(input_ids,attention_mask = attention_mask).last_hidden_state
-            
-            # Training step
-            optimizer.zero_grad()
-            # print('============================================')
-            # print(embeddings.dtype)
-            logits,decouple_loss = model(embeddings, TPS, adj, edge_type=edge_type, mask=attention_mask)
-            decouple_loss = decouple_loss.mean()         
-            loss_cls = criterion(logits,labels)
-            loss = loss_cls + args.lambda_decouple * decouple_loss
-            loss.backward()
-            optimizer.step()
+            scaler.scale(loss).backward()
+            if args.max_grad_norm > 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(
+                    [
+                        parameter
+                        for parameter in model.parameters()
+                        if parameter.requires_grad
+                    ],
+                    args.max_grad_norm,
+                )
+            scaler.step(optimizer)
+            scaler.update()
+            scheduler.step()
 
-            total_loss +=loss.item() * batch_size
-            loop.set_postfix(loss = loss.item(),cls=loss_cls.item(),dec=decouple_loss.item())
+            batch_size = labels.size(0)
+            predictions = logits.argmax(dim=-1)
+            total_loss += loss.item() * batch_size
+            total_examples += batch_size
+            total_diff += avg_diff.sum().item()
+            total_cosine += cosine_metric.item() * batch_size
+            correct += (predictions == labels).sum().item()
 
-        # Calculate average training loss for the epoch
-        avg_train_loss = total_loss / num_samples
-        print(f'[Epoch {epoch}] Average Loss: {avg_train_loss:.6f}')
-        
-        # Evaluate on validation set
-        print('Evaluate started...')
-        val_metrics = evaluate(model, bert_model, val_loader, device)
-        print(f"[Epoch {epoch}] Val Loss: {val_metrics['loss']:.4f} | "
-            f"Acc: {val_metrics['accuracy']:.4f} | "
-            f"F1: {val_metrics['f1']:.4f} | "
-            f"Recall: {val_metrics['recall']:.4f} | "
-            f"AUROC: {val_metrics['auroc']:.4f}")
+            progress.set_postfix({
+                "loss": f"{loss.item():.4f}",
+                "acc": f"{correct / total_examples:.4f}",
+                stat_label: f"{avg_diff.mean().item():.4f}",
+                "lr": f"{optimizer.param_groups[0]['lr']:.2e}",
+            })
 
-        # Save checkpoint for current epoch
-        epoch_model_path = os.path.join(args.save_dir,f'bilstm_gcn_epoch{epoch}.pt')
-        if isinstance(model,nn.DataParallel):
-            torch.save(model.module.state_dict(),epoch_model_path)
-        else:
-            torch.save(model.state_dict(), epoch_model_path)
-
-        # Log training progress
-        log_entry = {
-            'epoch': epoch,
-            'train_loss': avg_train_loss,
-            **val_metrics
+        train_metrics = {
+            "loss": total_loss / total_examples,
+            "accuracy": correct / total_examples,
+            "learning_rate": optimizer.param_groups[0]["lr"],
         }
-        with open(log_path, 'a', encoding='utf-8') as f:
-            f.write(json.dumps(log_entry,ensure_ascii=False)+'\n')
+        train_metrics[stat_key] = total_diff / total_examples
+        if args.view_mode == "dual":
+            train_metrics["avg_frozen_abs_cosine"] = (
+                total_cosine / total_examples
+            )
+        val_metrics = evaluate(model, val_loader, device, use_amp)
 
-        # Update best model if current performance improves
-        if val_metrics['auroc'] > best_auc:
-            best_auc = val_metrics['auroc']
-            best_model_path = os.path.join(args.save_dir, 'best_model.pt')
-            if isinstance(model, nn.DataParallel):
-                torch.save(model.module.state_dict(), best_model_path)
-            else:
-                torch.save(model.state_dict(), best_model_path)
-            print(f"[Epoch {epoch}] Best model updated! (AUROC={best_auc:.4f})")
-    
-    
-    print('Training finished.')
-    print(f"Best AUROC: {best_auc:.4f}")
+        print(
+            f"[Epoch {epoch}] "
+            f"Train Loss={train_metrics['loss']:.4f} | "
+            f"Train Acc={train_metrics['accuracy']:.4f} | "
+            f"LR={train_metrics['learning_rate']:.2e} | "
+            f"Train {stat_label}={train_metrics[stat_key]:.4f} | "
+            f"Val Loss={val_metrics['loss']:.4f} | "
+            f"Val Acc={val_metrics['accuracy']:.4f} | "
+            f"Val F1={val_metrics['f1']:.4f} | "
+            f"Val AUROC={val_metrics['auroc']:.4f} | "
+            f"Val {stat_label}={val_metrics[stat_key]:.4f}"
+        )
 
-    # Evaluate best model on test set
-    print("\nEvaluating best model on test set...")
-    test_best_model(args, bert_model, device, test_loader)
+        is_best_auroc = val_metrics["auroc"] > best_auroc
+        is_best_f1 = val_metrics["f1"] > best_f1
+        if is_best_auroc:
+            best_auroc = val_metrics["auroc"]
+        if is_best_f1:
+            best_f1 = val_metrics["f1"]
+
+        epoch_payload = checkpoint_payload(
+            model,
+            args,
+            epoch,
+            best_auroc,
+            best_f1,
+            val_metrics,
+        )
+        if args.save_every_epoch:
+            torch.save(
+                epoch_payload,
+                os.path.join(args.save_dir, f"epoch{epoch}.pt"),
+            )
+
+        if is_best_auroc:
+            torch.save(
+                epoch_payload,
+                os.path.join(args.save_dir, "best_auc_model.pt"),
+            )
+            # Backward-compatible alias used by evaluate.py and older scripts.
+            torch.save(
+                epoch_payload,
+                os.path.join(args.save_dir, "best_model.pt"),
+            )
+            print(f"Best model updated: AUROC={best_auroc:.6f}")
+
+        if is_best_f1:
+            torch.save(
+                epoch_payload,
+                os.path.join(args.save_dir, "best_f1_model.pt"),
+            )
+            print(f"Best F1 model updated: F1={best_f1:.6f}")
+
+        with open(log_path, "a", encoding="utf-8") as log_stream:
+            log_stream.write(json.dumps({
+                "epoch": epoch,
+                "train": train_metrics,
+                "validation": val_metrics,
+            }, ensure_ascii=False) + "\n")
+
+    print(
+        "Training finished. "
+        f"Best validation AUROC={best_auroc:.6f}, "
+        f"best validation F1={best_f1:.6f}"
+    )
+
+    if args.test_path:
+        test_dataset = TextDataset(args.test_path, mmap=args.mmap_data)
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=(device.type == "cuda"),
+            persistent_workers=(args.num_workers > 0),
+        )
+        best_checkpoint = torch.load(
+            os.path.join(args.save_dir, "best_model.pt"),
+            map_location="cpu",
+        )
+        if (
+            "encoder_state_dict" in best_checkpoint
+            and hasattr(model, "load_trainable_view_state_dict")
+        ):
+            model.load_trainable_view_state_dict(
+                best_checkpoint["encoder_state_dict"]
+            )
+        model.load_downstream_state_dict(
+            best_checkpoint["downstream_state_dict"]
+        )
+        test_metrics = evaluate(model, test_loader, device, use_amp)
+        print("Test metrics:")
+        print(json.dumps(test_metrics, ensure_ascii=False, indent=2))
 
 
-def test_best_model(args, bert_model, device, test_loader):
-    """
-    Evaluate the best saved model on test set.
-    
-    Args:
-        args: Command line arguments
-        bert_model: Pretrained BERT model for embeddings
-        device: Device to run evaluation on
-        test_loader: DataLoader for test data
-    """
-    with open('./checkpoints/dep2idx.json', 'r', encoding='utf-8') as f:
-            dep_list = json.load(f)
-    # dep_list = list(test_loader.dataset.dep2idx.keys())
-    model = SSD(
-        input_dim=args.input_dim,
-        hidden_dim=args.hidden_dim,
-        rgcn_hidden_dim=args.rgcn_hidden_dim,
-        num_class=args.num_class,
-        lstm_layers=args.lstm_layers,
-        dropout=args.dropout,
-        dep_list=dep_list,
-        max_seq_len=args.max_len
-    ).to(device)
-
-    best_model_path = os.path.join(args.save_dir, 'best_model.pt')
-    state_dict = torch.load(best_model_path, map_location=device)
-
-    if torch.cuda.device_count() > 1:
-        print(f"Using {torch.cuda.device_count()} GPUs for testing!")
-        model = nn.DataParallel(model)
-        new_state_dict = {}
-        for k, v in state_dict.items():
-            if k.startswith('module.'):
-                new_state_dict[k[7:]] = v
-            else:
-                new_state_dict[k] = v
-        model.module.load_state_dict(new_state_dict)
-    else:
-        model.load_state_dict(state_dict)
-
-    metrics = evaluate(model, bert_model, test_loader, device)
-    print("Test set evaluation:")
-    print(f"Loss: {metrics['loss']:.4f} | "
-        f"Acc: {metrics['accuracy']:.4f} | "
-        f"F1: {metrics['f1']:.4f} | "
-        f"Recall: {metrics['recall']:.4f} | "
-        f"Precision: {metrics['precision']:.4f} | "
-        f"AUROC: {metrics['auroc']:.4f}")
-
-
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Train SSD for LLM-Generated Text Detection')
-
-    parser.add_argument('--train_path', type = str, default = 'datasets/train.pt', help = 'Path to training dataset')
-    parser.add_argument('--val_path', type = str, default = 'datasets/val.pt', help = 'Path to validation dataset')
-    parser.add_argument('--test_path', type=str, default='datasets/AcademicResearch/test.pt', help='Path to test dataset')
-    parser.add_argument('--tokenizer', type = str, default = './models/roberta-base',help = 'BERT tokenizer name or path')
-    parser.add_argument('--max_len', type = int, default = 256, help = 'Maximum sequence length')
-
-
-    parser.add_argument('--input_dim', type = int, default = 768, help = 'BiLSTM input dimension')
-    parser.add_argument('--hidden_dim', type = int, default = 768, help = 'BiLSTM hidden dimension')
-    parser.add_argument('--rgcn_hidden_dim', type = int, default = 512, help = 'RGCN hidden dimension')
-    parser.add_argument('--num_class', type = int, default = 2, help = 'Number of output classes (Human vs LLM-generated)')
-    parser.add_argument('--lstm_layers', type = int, default = 2, help = 'Number of BiLSTM layers')
-    parser.add_argument('--dropout', type = float, default = 0.6, help = 'Dropout probability')
-    parser.add_argument('--lambda_decouple', type = float, default = 1.0, help = '')
-    
-
-
-    parser.add_argument('--batch_size', type = int, default = 128, help = 'Batch size')
-    parser.add_argument('--epochs', type = int, default = 30, help = 'Number of training epochs')
-    parser.add_argument('--lr' , type = float, default = 1e-5, help = 'Learning rate')
-    parser.add_argument('--weight_decay', type = float, default = 1e-4, help = 'L2 regularization weight decay')
-    parser.add_argument('--save_dir', type = str ,default = './checkpoints/+D', help = 'Model checkpoint directory')
-
-    args = parser.parse_args()
-    train(args)
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Train the frozen label-free bi-view detector"
+    )
+    parser.add_argument("--train_path", default="datasets/train.pt")
+    parser.add_argument("--val_path", default="datasets/val.pt")
+    parser.add_argument(
+        "--test_path", default=""
+    )
+    parser.add_argument(
+        "--seq_ckpt",
+        default="checkpoints/C4/sequential_transformer_c4_300k.pt",
+    )
+    parser.add_argument(
+        "--graph_ckpt",
+        default="checkpoints/C4/graph_rgcn_c4_300k.pt",
+    )
+    parser.add_argument("--roberta", default="models/roberta-base")
+    parser.add_argument("--num_relations", type=int, default=45)
+    parser.add_argument("--num_class", type=int, default=2)
+    parser.add_argument("--num_heads", type=int, default=4)
+    parser.add_argument("--dropout", type=float, default=0.6)
+    parser.add_argument(
+        "--view_mode",
+        choices=("dual", "sequence", "structure"),
+        default="dual",
+        help="Use both pretrained views or one frozen pretrained view.",
+    )
+    parser.add_argument(
+        "--freeze_encoders",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Freeze the sequence/structure encoders. Use "
+            "--no-freeze_encoders for supervised end-to-end training; "
+            "RoBERTa remains frozen."
+        ),
+    )
+    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--lr", type=float, default=1e-5)
+    parser.add_argument("--weight_decay", type=float, default=1e-4)
+    parser.add_argument("--label_smoothing", type=float, default=0.05)
+    parser.add_argument("--warmup_ratio", type=float, default=0.05)
+    parser.add_argument("--min_lr", type=float, default=1e-6)
+    parser.add_argument("--max_grad_norm", type=float, default=1.0)
+    parser.add_argument("--num_workers", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--save_dir", default="checkpoints/frozen_biview")
+    parser.add_argument(
+        "--save_every_epoch",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument(
+        "--amp",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--mmap_data",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    train(parser.parse_args())

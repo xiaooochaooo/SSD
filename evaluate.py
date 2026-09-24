@@ -1,167 +1,220 @@
-import torch
-from torch.utils.data import DataLoader
-from transformers import AutoModel
-from models.models import SSD
-from utils.data_loader import TextDataset
-import torch.nn as nn
-from tqdm import tqdm
-from sklearn.metrics import accuracy_score, f1_score, recall_score, precision_score, roc_auc_score
 import argparse
-import os
 import json
-import csv
+import os
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from sklearn.metrics import (
+    accuracy_score,
+    confusion_matrix,
+    f1_score,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+
+from models.models import (
+    FrozenPretrainedBiViewDetector,
+    FrozenPretrainedSingleViewDetector,
+)
+from utils.data_loader import TextDataset
 
 
-def evaluate(model, bert_model, dataloader, device, save_alpha_path=None):
-    '''
-    Evaluation function: computes loss, accuracy, f1, recall, precision, and AUROC metrics.
-    
-    Args:
-        model: Trained BiLSTM_RGCN model
-        bert_model: Pretrained BERT model for embeddings
-        dataloader: DataLoader containing evaluation data
-        device: Device to run evaluation on
-    
-    Returns:
-        dict: Dictionary containing evaluation metrics
-    '''
-    model.eval()
-    all_preds, all_labels, all_probs = [], [], []
-    total_loss = 0.0
-    total_cls_loss = 0.0
-    total_dec_loss = 0.0
-    criterion = nn.CrossEntropyLoss()
-
-    
-    with torch.no_grad():
-        for batch in tqdm(dataloader, ncols=100, desc="Evaluating"):
-            input_ids = batch['input_ids'].to(device)
-            attention_mask = batch['attention_mask'].to(device)
-            adj = batch['adj'].to(device)
-            edge_type = batch['edge_type'].to(device)
-            labels = batch['label'].to(device)
-            TPS = batch['TPS'].to(device)
-
-            embeddings = bert_model(input_ids, attention_mask=attention_mask).last_hidden_state
-            logits, decouple_loss= model(embeddings, TPS, adj, edge_type=edge_type, mask=attention_mask)
-            decouple_loss = decouple_loss.mean()
-            loss_cls = criterion(logits, labels)
-            loss = loss_cls + 0.1 * decouple_loss
-            total_loss += loss.item()
-            total_cls_loss += loss_cls.item()
-            total_dec_loss += decouple_loss.item()
-
-            probs = torch.softmax(logits, dim=-1)[:, -1]
-            preds = torch.argmax(logits, dim=-1)
-
-            all_probs.extend(probs.cpu().tolist())
-            all_preds.extend(preds.cpu().tolist())
-            all_labels.extend(labels.cpu().tolist())
-
-
-
-
-    avg_loss = total_loss / len(dataloader)
-    avg_cls_loss = total_cls_loss / len(dataloader)
-    avg_dec_loss = total_dec_loss / len(dataloader)
-    acc = accuracy_score(all_labels, all_preds)
-    f1 = f1_score(all_labels, all_preds, average='macro')
-    recall = recall_score(all_labels, all_preds, average='macro')
-    precision = precision_score(all_labels, all_preds, average='macro')
-    auroc = roc_auc_score(all_labels, all_probs)
-
+def move_batch(batch, device):
     return {
-        'loss': avg_loss,
-        'cls_loss': avg_cls_loss,
-        'dec_loss': avg_dec_loss,
-        'accuracy': acc,
-        'precision': precision,
-        'recall': recall,
-        'f1': f1,
-        'auroc': auroc
+        key: value.to(device, non_blocking=(device.type == "cuda"))
+        if torch.is_tensor(value) else value
+        for key, value in batch.items()
     }
 
 
-def load_and_evaluate(args):
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f"Using device: {device}")
+@torch.no_grad()
+def evaluate(args):
+    if not 0.0 <= args.threshold <= 1.0:
+        raise ValueError("threshold must be in [0, 1]")
 
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    use_amp = args.amp and device.type == "cuda"
+    checkpoint = torch.load(args.ckpt_path, map_location="cpu")
+    if not isinstance(checkpoint, dict) or "downstream_state_dict" not in checkpoint:
+        raise ValueError(
+            "Expected a bi-view detector checkpoint containing "
+            "downstream_state_dict"
+        )
 
-    with open('./checkpoints/dep2idx_stanza.json', 'r', encoding='utf-8') as f:
-            dep_list = json.load(f)
-    # with open('./checkpoints/pos2idx.json','r',encoding='utf-8') as f:
-    #         pos_list = json.load(f)
-    # train_dataset = TextDataset(args.train_path, tokenizer_name=args.tokenizer, max_len=args.max_len)
-    test_dataset = TextDataset(args.test_path)
-    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
+    saved_args = checkpoint.get("args", {})
+    view_mode = saved_args.get("view_mode", "dual")
+    seq_ckpt = args.seq_ckpt or saved_args.get("seq_ckpt")
+    graph_ckpt = args.graph_ckpt or saved_args.get("graph_ckpt")
+    if view_mode == "dual" and (not seq_ckpt or not graph_ckpt):
+        raise ValueError("Sequence and graph pretraining checkpoints are required")
+    if view_mode == "sequence" and not seq_ckpt:
+        raise ValueError("Sequence pretraining checkpoint is required")
+    if view_mode == "structure" and not graph_ckpt:
+        raise ValueError("Graph pretraining checkpoint is required")
 
-
-
-    bert_model = AutoModel.from_pretrained(args.tokenizer).to(device)
-    bert_model.eval()
-    for p in bert_model.parameters():
-        p.requires_grad = False
-
-    # dep_list = list(train_dataset.dep2idx.keys())
-    dep_list = list(dep_list.keys())
-    model = SSD(
-        input_dim=args.input_dim,
-        hidden_dim=args.hidden_dim,
-        rgcn_hidden_dim=args.rgcn_hidden_dim,
-        num_class=args.num_class,
-        lstm_layers=args.lstm_layers,
-        dropout=args.dropout,
-        dep_list=dep_list,
-        max_seq_len=args.max_len
-    ).to(device)
-    
-    best_model_path = os.path.join(args.save_dir, 'best_model.pt')
-    assert os.path.exists(best_model_path), f"Model weight file not found: {best_model_path}"
-
-    state_dict = torch.load(best_model_path, map_location=device)
-
-    
-    if torch.cuda.device_count() > 1:
-        print(f"Using {torch.cuda.device_count()} GPUs for evaluation!")
-        model = nn.DataParallel(model)
-        new_state_dict = {}
-        for k, v in state_dict.items():
-            if k.startswith('module.'):
-                new_state_dict[k[7:]] = v
-            else:
-                new_state_dict[k] = v
-        model.module.load_state_dict(new_state_dict)
+    common_kwargs = {
+        "roberta_name": saved_args.get("roberta", args.roberta),
+        "num_relations": saved_args.get("num_relations", args.num_relations),
+        "num_class": saved_args.get("num_class", args.num_class),
+        "num_heads": saved_args.get("num_heads", args.num_heads),
+        "dropout": saved_args.get("dropout", args.dropout),
+    }
+    if view_mode == "dual":
+        model = FrozenPretrainedBiViewDetector(
+            seq_ckpt=seq_ckpt,
+            graph_ckpt=graph_ckpt,
+            freeze_encoders=saved_args.get("freeze_encoders", True),
+            **common_kwargs,
+        ).to(device)
     else:
-        model.load_state_dict(state_dict)
+        model = FrozenPretrainedSingleViewDetector(
+            view_type=view_mode,
+            seq_ckpt=seq_ckpt if view_mode == "sequence" else None,
+            graph_ckpt=graph_ckpt if view_mode == "structure" else None,
+            **common_kwargs,
+        ).to(device)
+    if (
+        "encoder_state_dict" in checkpoint
+        and hasattr(model, "load_trainable_view_state_dict")
+    ):
+        model.load_trainable_view_state_dict(checkpoint["encoder_state_dict"])
+    model.load_downstream_state_dict(checkpoint["downstream_state_dict"])
+    model.eval()
 
-    
-    metrics = evaluate(model, bert_model, test_loader, device)
-    print(f"Evaluation Results on Test Set {args.test_path}:")
-    print(f"Loss: {metrics['loss']:.4f}")
-    print(f"Accuracy: {metrics['accuracy']:.4f}")
-    print(f"Precision: {metrics['precision']:.4f}")
-    print(f"Recall: {metrics['recall']:.4f}")
-    print(f"F1-score: {metrics['f1']:.4f}")
-    print(f"AUROC: {metrics['auroc']:.4f}")
+    dataset = TextDataset(args.data_path, mmap=args.mmap_data)
+    loader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=(device.type == "cuda"),
+        persistent_workers=(args.num_workers > 0),
+    )
+
+    criterion = nn.CrossEntropyLoss()
+    total_loss = 0.0
+    total_examples = 0
+    predictions = []
+    labels_all = []
+    scores = []
+    probabilities_all = []
+    discrepancy_all = []
+    total_cosine = 0.0
+
+    for batch in tqdm(loader, desc="Evaluating", ncols=100):
+        batch = move_batch(batch, device)
+        labels = batch["label"].long().view(-1)
+
+        with torch.amp.autocast(
+            device_type=device.type,
+            dtype=torch.float16,
+            enabled=use_amp,
+        ):
+            logits, _, avg_diff, cosine_metric = model(
+                input_ids=batch["input_ids"],
+                TPS=batch["TPS"],
+                adj=batch["adj"],
+                edge_type=batch["edge_type"],
+                mask=batch["attention_mask"],
+            )
+            loss = criterion(logits.float(), labels)
+
+        batch_size = labels.size(0)
+        probabilities = F.softmax(logits.float(), dim=-1)
+        batch_predictions = (
+            probabilities[:, 1] >= args.threshold
+        ).long()
+
+        total_loss += loss.item() * batch_size
+        total_examples += batch_size
+        total_cosine += cosine_metric.item() * batch_size
+        predictions.extend(batch_predictions.cpu().tolist())
+        labels_all.extend(labels.cpu().tolist())
+        scores.extend(probabilities[:, 1].cpu().tolist())
+        probabilities_all.extend(probabilities.cpu().tolist())
+        discrepancy_all.extend(avg_diff.cpu().tolist())
+
+    metrics = {
+        "threshold": args.threshold,
+        "loss": total_loss / max(total_examples, 1),
+        "accuracy": accuracy_score(labels_all, predictions),
+        "precision": precision_score(
+            labels_all, predictions, average="macro", zero_division=0
+        ),
+        "recall": recall_score(
+            labels_all, predictions, average="macro", zero_division=0
+        ),
+        "f1": f1_score(
+            labels_all, predictions, average="macro", zero_division=0
+        ),
+        "auroc": roc_auc_score(labels_all, scores)
+        if len(set(labels_all)) == 2 else 0.0,
+    }
+    stat_key = "avg_frozen_D" if view_mode == "dual" else "avg_view_norm"
+    metrics[stat_key] = sum(discrepancy_all) / max(len(discrepancy_all), 1)
+    if view_mode == "dual":
+        metrics["avg_frozen_abs_cosine"] = (
+            total_cosine / max(total_examples, 1)
+        )
+    matrix = confusion_matrix(labels_all, predictions).tolist()
+
+    print(json.dumps(metrics, ensure_ascii=False, indent=2))
+    print("Confusion matrix:")
+    print(matrix)
+
+    if args.save_pred_path:
+        output_dir = os.path.dirname(args.save_pred_path)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+        torch.save({
+            "preds": predictions,
+            "labels": labels_all,
+            "scores": scores,
+            "probs": probabilities_all,
+            stat_key: discrepancy_all,
+            "metrics": metrics,
+            "confusion_matrix": matrix,
+        }, args.save_pred_path)
+        print(f"Saved predictions to {args.save_pred_path}")
 
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Evaluate BiLSTM+GCN on Test Dataset')
-
-    parser.add_argument('--test_path', type=str, default='datasets/L2R/L2R_llm.pt', help='Path to test dataset')
-    parser.add_argument('--train_path', type = str, default = './datasets/train.pt', help = 'Path to training dataset (for vocabulary reference)')
-    parser.add_argument('--tokenizer', type=str, default='./models/roberta-base', help='BERT tokenizer path')
-    parser.add_argument('--max_len', type=int, default=512, help='Maximum sequence length')
-
-    parser.add_argument('--input_dim', type=int, default=768, help='BiLSTM input dimension')
-    parser.add_argument('--hidden_dim', type=int, default=768, help='BiLSTM hidden dimension')
-    parser.add_argument('--rgcn_hidden_dim', type=int, default=512, help='RGCN hidden dimension')
-    parser.add_argument('--num_class', type=int, default=2, help='Number of classification classes')
-    parser.add_argument('--lstm_layers', type=int, default=2, help='Number of LSTM layers')
-    parser.add_argument('--dropout', type=float, default=0.5, help='Dropout probability')
-
-    parser.add_argument('--batch_size', type=int, default=128, help='Evaluation batch size')
-    parser.add_argument('--save_dir', type=str, default='checkpoints/+D', help='Model checkpoint directory')
-
-    args = parser.parse_args()
-    load_and_evaluate(args)
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Evaluate a frozen or end-to-end bi-view detector"
+    )
+    parser.add_argument(
+        "--data_path", default="datasets/test.pt"
+    )
+    parser.add_argument(
+        "--ckpt_path",
+        default="checkpoints/frozen_biview_transformer_300k_final/best_auc_model.pt",
+    )
+    parser.add_argument(
+        "--save_pred_path",
+        default="",
+    )
+    parser.add_argument("--seq_ckpt", default=None)
+    parser.add_argument("--graph_ckpt", default=None)
+    parser.add_argument("--roberta", default="models/roberta-base")
+    parser.add_argument("--num_relations", type=int, default=45)
+    parser.add_argument("--num_class", type=int, default=2)
+    parser.add_argument("--num_heads", type=int, default=4)
+    parser.add_argument("--dropout", type=float, default=0.6)
+    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--threshold", type=float, default=0.5)
+    parser.add_argument("--num_workers", type=int, default=0)
+    parser.add_argument(
+        "--amp",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--mmap_data",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    evaluate(parser.parse_args())

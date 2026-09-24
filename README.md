@@ -1,6 +1,6 @@
-# Beyond Surface Fluency: Domain-Robust LLM-Generated Text Detection via Sequential-Structural Discrepancy
+# SSD: Label-Free Sequential–Structural Discrepancy for LLM-Generated Text Detection
 
-<img src="images/framework.png" width="1000px">
+This repository contains the implementation of **SSD**, a dual-view detector that models the discrepancy between sequential context and dependency structure. Large datasets, pretrained language models, experiment outputs, and learned checkpoints are intentionally excluded from the repository.
 
 ## Catalogue
 
@@ -9,214 +9,260 @@
 - [Data Preparation](#data-preparation)
 - [Training](#training)
 - [Evaluation](#evaluation)
-- [Adversarial Attack](#evaluation)
-- [Adversarial Attack](#Adversarial-Attack)
+- [Label-Free Discrepancy Extraction](#label-free-discrepancy-extraction)
+- [Adversarial Attack](#adversarial-attack)
 - [Expected Performance](#expected-performance)
 - [Citation](#citation)
 
 ## Introduction
 
-We introduce **SSD (Structure-Semantic Discrepancy)**, a novel model for detecting LLM-generated text. Unlike traditional methods that rely solely on semantic features, SSD jointly leverages **sequential semantics** (via BiLSTM) and **syntactic structure** (via Relational Graph Convolution Networks over dependency parse trees) to capture the discrepancy between human-written and machine-generated text.
+SSD represents each token from two complementary views:
 
-The core innovation is the **SSD** mechanism, which:
+- A **Transformer sequence encoder** captures ordered contextual information.
+- A **Relational Graph Convolutional Network (RGCN)** captures dependency relations.
 
-- Encodes sequential context using a **BiLSTM** (or other) encoder
-- Models syntactic dependencies using a **RGCN** over dependency parse graphs
-- Computes a **gated fusion** between semantic and structural features to highlight their discrepancy
-- Applies **Discrepancy-Based Classification** to produce a sentence-level representation for binary classification (Human vs. LLM-generated)
+The two encoders are first pretrained on an unlabeled corpus. For randomly masked tokens, each branch independently predicts the same frozen RoBERTa target representation. Human/LLM labels, provenance labels, a detector classifier, and cross-view contrastive negatives are not used during this stage.
 
-Additionally, we provide an **adversarial attack pipeline** that tests model robustness through rewrite attack and Decoherence
-Attack.
+After pretraining, the view encoders are frozen for the main detector. For token (i), SSD computes
+
+\[
+\mathbf{D}_i = |\mathbf{h}^{seq}_i-\mathbf{h}^{str}_i|,
+\qquad
+d_i = \operatorname{mean}(\mathbf{D}_i).
+\]
+
+The fixed discrepancy feature guides token-level view fusion. The fused representation is concatenated with the token proxy score (TPS), processed by multi-head self-attention, max-pooled, and classified as human-written or LLM-generated text.
+
+The main implementation is in `models/models.py`. The repository also retains the single-view detector classes used by the paper's ablations.
 
 ## Environment
 
-- **Ubuntu 20.04**
-- **CUDA**: 12.6
-- **Python**: 3.10
-
-We recommend using Anaconda to set up the environment:
+The experiments were developed with Python 3.10 and CUDA-enabled PyTorch. Install the Python dependencies with:
 
 ```bash
 conda create -n ssd python=3.10
 conda activate ssd
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
-pip install torch_geometric
-pip install transformers spacy scikit-learn tqdm nltk langchain-openai
+
+# Select the PyTorch build appropriate for your CUDA installation.
+pip install torch torchvision torchaudio
+pip install -r requirements.txt
 python -m spacy download en_core_web_lg
 ```
 
+The core dependencies are PyTorch, PyTorch Geometric, Transformers, spaCy, scikit-learn, and tqdm. `langchain-openai` is only needed for the optional rewrite attack.
+
 ## Data Preparation
 
-### Pre-trained Models Required
+### External models
 
-Before running the code, download the following pre-trained models:
+The repository does not contain external model weights. Place the required models at:
 
-| Model | Purpose | Path |
-|-------|---------|------|
-| `roberta-base` | Tokenizer & BERT embeddings | `./models/roberta-base/` |
-| `Qwen3` (optional) | Token probability sequence | `./models/Qwen3/` |
+| Model | Purpose | Expected path |
+|---|---|---|
+| RoBERTa-base | Frozen reconstruction target and tokenizer | `models/roberta-base/` |
+| Qwen3 | Optional TPS extraction for downstream data | `models/Qwen3/` |
 
-These can be downloaded from Hugging Face:
+For example:
 
 ```bash
-# Download RoBERTa-base
 git lfs install
-git clone https://huggingface.co/roberta-base ./models/roberta-base
-
-# Download Qwen3 (optional, for TPS feature)
-git clone https://huggingface.co/Qwen/Qwen3-4B ./models/Qwen3
+git clone https://huggingface.co/FacebookAI/roberta-base models/roberta-base
 ```
 
-### Build Dependency Vocabulary
+### Input format
 
-```bash
-python -c "
-import json
-from utils.dep_parse import sentence_to_dep_matrix
+Raw data are JSON arrays. Each item contains `text` and `result`:
 
-# Build dep2idx from sample texts
-dep_set = set()
-sample_texts = [
-    'The quick brown fox jumps over the lazy dog.',
-    'I am writing a research paper on text detection.',
-    'This is an example sentence for dependency parsing.'
+```json
+[
+  {"text": "An example document.", "result": 0},
+  {"text": "Another example document.", "result": 1}
 ]
-for text in sample_texts:
-    adj, tokens, dep_types, pos_tags, tps = sentence_to_dep_matrix(text)
-    for row in dep_types:
-        for dep in row:
-            if dep:
-                dep_set.add(dep)
-
-dep2idx = {dep: i for i, dep in enumerate(sorted(dep_set))}
-with open('checkpoints/dep2idx.json', 'w') as f:
-    json.dump(dep2idx, f, indent=2)
-print('dep2idx saved to checkpoints/dep2idx.json')
-"
 ```
 
-### Preprocess Datasets
+For downstream detection, `0` denotes human text and `1` denotes LLM-generated text. Labels in the unlabeled pretraining corpus are ignored and may be set to a dummy value.
 
-Raw datasets should be JSON files where each item contains a `text` field (the sentence) and a `result` field (`0` for human-written, `1` for LLM-generated).
+### Preprocess unlabeled pretraining data
 
-Edit `prepare_vocabe.py` to set your input/output paths, then run:
+Prepare each corpus shard without TPS:
 
 ```bash
-python prepare_vocabe.py
+python prepare_vocabe.py \
+  --src_json_path datasets/C4/c4_train_300k_part01-of-03.json \
+  --save_pt_path datasets/C4/c4_train_300k_part01-of-03.pt \
+  --tokenizer_name models/roberta-base \
+  --max_len 256 \
+  --dep2idx_path checkpoints/dep2idx.json \
+  --no-use_tps
 ```
 
-This produces `.pt` files containing preprocessed tensors (input_ids, attention_mask, adjacency matrices, edge types, TPS features, and labels).
+Repeat this command for all pretraining shards. The provided training scripts expect files matching:
+
+```text
+datasets/C4/c4_train_300k_part*-of-03.pt
+```
+
+### Preprocess downstream data
+
+When TPS is used, place Qwen3 at `models/Qwen3/` and enable it during preprocessing:
+
+```bash
+python prepare_vocabe.py \
+  --src_json_path datasets/train.json \
+  --save_pt_path datasets/train.pt \
+  --tokenizer_name models/roberta-base \
+  --max_len 256 \
+  --dep2idx_path checkpoints/dep2idx.json \
+  --use_tps
+```
+
+Apply the same preprocessing settings to validation and test data. Each `.pt` sample contains RoBERTa token IDs, an attention mask, the dependency adjacency matrix, dependency relation IDs, TPS values, and the binary label.
 
 ## Training
 
-To train the SSD model from scratch:
+Training has three stages. Run all commands from the repository root.
+
+### 1. Pretrain the sequence encoder
 
 ```bash
-python train.py \
-  --train_path datasets/train.pt \
-  --val_path datasets/val.pt \
-  --test_path datasets/AcademicResearch/test.pt \
-  --tokenizer ./models/roberta-base \
-  --max_len 256 \
-  --input_dim 768 \
-  --hidden_dim 768 \
-  --rgcn_hidden_dim 512 \
-  --num_class 2 \
-  --lstm_layers 2 \
-  --dropout 0.6 \
-  --batch_size 128 \
-  --epochs 30 \
-  --lr 1e-5 \
-  --weight_decay 1e-4 \
-  --lambda_decouple 1.0 \
-  --save_dir ./checkpoints/SSD
+GPU_ID=0 bash train_seq.sh
 ```
 
-**Key Training Configurations:**
+This trains a two-layer Transformer sequence encoder with the label-free masked reconstruction objective and saves:
 
-- **BERT Encoder**: RoBERTa-base is used as a frozen feature extractor (gradients disabled).
-- **Decouple Loss**: Controlled by `--lambda_decouple`. Encourages the semantic and structural representations to be complementary.
-- **SSD**: The model uses a 2-layer BiLSTM (or other encoder) and a 2-layer RGCN for sequential and structural encoding respectively.
-- **Multi-GPU**: The code automatically detects and utilizes multiple GPUs via `nn.DataParallel`.
+```text
+checkpoints/C4/sequential_transformer_c4_300k.pt
+```
+
+### 2. Pretrain the structure encoder
+
+```bash
+GPU_ID=1 bash train_str.sh
+```
+
+This trains a two-layer RGCN structure encoder with the same frozen target space and saves:
+
+```text
+checkpoints/C4/graph_rgcn_c4_300k.pt
+```
+
+The sequence and structure pretraining jobs are independent and may be run in parallel on different GPUs.
+
+### 3. Train the downstream detector
+
+Place the processed files at `datasets/train.pt` and `datasets/val.pt`, then run:
+
+```bash
+GPU_ID=0 bash train_classifier.sh
+```
+
+The main configuration freezes both pretrained view encoders and trains only the discrepancy-guided fusion, multi-head self-attention, and classifier. The best validation-AUROC checkpoint is saved to:
+
+```text
+checkpoints/frozen_biview_transformer_300k_final/best_auc_model.pt
+```
+
+All shell scripts accept additional command-line arguments. For example:
+
+```bash
+GPU_ID=0 bash train_classifier.sh --epochs 20 --batch_size 32
+```
 
 ## Evaluation
 
-To evaluate a trained model on a test set:
+Evaluate the saved detector with:
+
+```bash
+GPU_ID=0 bash evaluate.sh \
+  --data_path datasets/OOD/M4.pt \
+  --threshold 0.41
+```
+
+The script reports accuracy, macro precision, macro recall, macro F1, AUROC, a confusion matrix, and the mean frozen discrepancy. The decision threshold affects discrete metrics but does not affect AUROC.
+
+To evaluate a checkpoint moved from another machine, the encoder paths may be supplied explicitly:
 
 ```bash
 python evaluate.py \
-  --test_path datasets/L2R/L2R_llm.pt \
-  --tokenizer ./models/roberta-base \
-  --max_len 512 \
-  --input_dim 768 \
-  --hidden_dim 768 \
-  --rgcn_hidden_dim 512 \
-  --num_class 2 \
-  --lstm_layers 2 \
-  --dropout 0.5 \
+  --data_path datasets/test.pt \
+  --ckpt_path checkpoints/frozen_biview_transformer_300k_final/best_auc_model.pt \
+  --seq_ckpt checkpoints/C4/sequential_transformer_c4_300k.pt \
+  --graph_ckpt checkpoints/C4/graph_rgcn_c4_300k.pt \
+  --save_pred_path "" \
   --batch_size 128 \
-  --save_dir ./checkpoints/SSD
+  --threshold 0.41 \
+  --amp \
+  --mmap_data
 ```
 
-The evaluation script automatically loads the `best_model.pt` checkpoint from the specified `--save_dir` and reports the following metrics:
+## Label-Free Discrepancy Extraction
 
-- **Accuracy**: Binary classification accuracy
-- **Precision**: Macro-averaged precision
-- **Recall**: Macro-averaged recall
-- **F1-score**: Macro-averaged F1
-- **AUROC**: Area Under the Receiver Operating Characteristic curve
+`trainfree_discrepancy.py` extracts one sentence-level discrepancy value per sample without training a downstream detector. The full input is used at inference; no random masking is applied. Special tokens and padding are excluded before averaging token discrepancies.
+
+```bash
+python trainfree_discrepancy.py \
+  --data_path datasets/test.pt \
+  --human_output_csv results/tf_human_D.csv \
+  --llm_output_csv results/tf_llm_D.csv \
+  --seq_ckpt checkpoints/C4/sequential_transformer_c4_300k.pt \
+  --graph_ckpt checkpoints/C4/graph_rgcn_c4_300k.pt
+```
+
+Labels are used only after each score has been computed, to route the score into the human or LLM output file. If LLM text is treated as the positive class while human text has the larger discrepancy, use `-D` as the AUROC score and state the direction explicitly.
 
 ## Adversarial Attack
 
-We provide an adversarial attack pipeline in `attack.py` to evaluate model robustness:
-
-### Rewrite Attack
-
-Uses DeepSeek (via LangChain) to rewrite text while preserving meaning:
+`attack.py` contains the rewrite and decoherence perturbation utilities used for robustness evaluation. Do not commit API credentials or generated attack data.
 
 ```bash
-export DS_DEEPSEEK_API_KEY="your-api-key"
-python attack.py
-```
+# Rewrite attack (requires DS_DEEPSEEK_API_KEY)
+python attack.py \
+  --mode rewrite \
+  --input_path datasets/Attack/input.json \
+  --output_path datasets/Attack/rewrite.json
 
-The script launches 10 threads in parallel, each processing a separate JSON file (`datasets/Attack/test{0-9}.json`). The rewritten outputs are saved to `datasets/Attack/test{0-9}_output.json`.
-
-### Decoherence Attack
-
-Swaps adjacent words in sentences exceeding a threshold length to create perturbed variants. Edit the input/output file paths in the `main()` function of `attack.py`, then run:
-
-```bash
-python attack.py
+# Local adjacent-token decoherence attack
+python attack.py \
+  --mode decoherence \
+  --input_path datasets/Attack/input.json \
+  --output_path datasets/Attack/decoherence.json \
+  --swap_threshold 20 \
+  --seed 42
 ```
 
 ## Expected Performance
 
-In-domain performance comparison in terms of AUROC scores (%). Bolded values indicate the maximum scores, while underlined values denote the second-highest scores. AVERAGE measures the average performance among all independent domains, and STD measures the standard deviation across domains. SSD achieves the highest average (96.43%) and lowest standard deviation (3.88%), demonstrating superior and more stable in-domain detection.
+The current 300K-pretraining configuration produced the following AUROC values in the reported run:
 
-| Domain | Fast-DetectGPT | RAIDAR | Lastde | Ghostbusters | L2R | SSD |
-|--------|:--------------:|:------:|:------:|:------------:|:---:|:---:|
-| AcademicResearch | 48.55 | 83.11 | 60.87 | 65.70 | 84.06 | **95.64** |
-| ArtCulture | 63.25 | 77.11 | 78.97 | 67.55 | 83.28 | **96.23** |
-| Business | 69.29 | 83.69 | 84.70 | 84.41 | 91.56 | **96.99** |
-| Code | 69.42 | 38.40 | 84.42 | 38.38 | 83.83 | **99.99** |
-| EducationMaterial | 75.46 | 96.75 | 89.75 | 85.23 | 96.44 | **98.45** |
-| Entertainment | 85.01 | 83.19 | 97.88 | 87.39 | 94.94 | **98.93** |
-| Environmental | 83.25 | 92.28 | 98.26 | 84.17 | 97.86 | **99.99** |
-| Finance | 69.69 | 81.53 | 84.71 | 78.82 | 94.00 | **98.25** |
-| FoodCuisine | 76.84 | 78.31 | 90.31 | 68.46 | 95.47 | **97.69** |
-| GovernmentPublic | 71.46 | 76.19 | 85.77 | 68.28 | 86.75 | **94.99** |
-| LegalDocument | 83.77 | 65.94 | **99.67** | 54.14 | 78.03 | 97.61 |
-| LiteratureCreativeWriting | 79.43 | 91.61 | 95.99 | 94.56 | 92.94 | **99.47** |
-| MedicalText | 56.48 | 77.00 | **91.15** | 63.67 | 78.57 | 86.76 |
-| NewsArticle | 60.82 | 85.47 | 74.11 | 68.66 | 92.42 | **96.00** |
-| OnlineContent | 63.12 | 82.31 | 78.56 | 60.22 | 88.81 | **97.33** |
-| PersonalCommunication | 55.78 | 72.33 | 70.46 | 70.42 | 82.39 | **88.74** |
-| ProductReview | 66.80 | 80.75 | 81.56 | 73.59 | 96.89 | **97.57** |
-| Religious | 66.00 | 83.97 | 79.75 | 61.00 | 97.75 | **98.92** |
-| Sports | 60.17 | 78.69 | 76.46 | 66.66 | 87.42 | **87.85** |
-| TechnicalWriting | 60.96 | 85.75 | 76.36 | 72.30 | 93.69 | **98.33** |
-| TravelTourism | 62.47 | 88.97 | 79.16 | 76.07 | 94.75 | **99.29** |
-| **AVERAGE** | 68.00 | 79.70 | 83.69 | 71.01 | 90.09 | **96.43** |
-| **STD** | 9.90 | 11.81 | 9.75 | 12.59 | 6.34 | **3.88** |
+| Evaluation setting | AUROC (%) |
+|---|---:|
+| L2R / in-domain | 96.59 |
+| M4 / out-of-domain | 78.39 |
 
-> **Note**: Actual results may vary depending on data distribution, hyperparameters, and random seeds.
+Results may vary with preprocessing, corpus sampling, dependency parsing, TPS extraction, random seed, hardware, and software versions. For paper reporting, use repeated runs and report mean and standard deviation rather than treating the values above as guaranteed outputs.
+
+## Repository Structure
+
+```text
+SSD/
+├── sequential.py               # Transformer sequence pretraining
+├── structual.py                # RGCN structure pretraining
+├── train.py                    # Downstream detector training
+├── evaluate.py                 # Detector evaluation
+├── trainfree_discrepancy.py    # Label-free sentence-D extraction
+├── prepare_vocabe.py           # Token/graph/TPS preprocessing
+├── attack.py                   # Optional robustness attacks
+├── train_seq.sh
+├── train_str.sh
+├── train_classifier.sh
+├── evaluate.sh
+├── models/models.py
+├── utils/
+└── checkpoints/dep2idx.json
+```
+
+The filename `structual.py` is retained for compatibility with the released checkpoints and scripts.
+
+## Citation
+
+If you use this code, please cite the accompanying paper. The final BibTeX entry will be added after publication.

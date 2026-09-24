@@ -1,129 +1,88 @@
+"""Generate rewrite or local decoherence attacks for JSON datasets."""
+
+import argparse
 import json
-import threading
 import os
-from tqdm import tqdm
-from langchain_openai import ChatOpenAI
-
-
-ds = ChatOpenAI(
-    model = 'deepseek-v4-pro',
-    api_key= os.getenv("DS_DEEPSEEK_API_KEY"),
-    base_url = 'https://api.deepseek.com',
-)
-
-def process_file(file_index):
-    input_filename = f'datasets/Attack/test{file_index}.json'
-    output_filename = f'datasets/Attack/test{file_index}_output.json'
-    
-    print(f"[-{file_index}] processing {input_filename}")
-    
-    with open(input_filename, 'r', encoding='utf-8') as f:
-        data = json.load(f)
-    
-    print(f"[{file_index}] total {len(data)} datas")
-    
-    res = []
-    
-    for idx, item in enumerate(tqdm(data, desc=f"thread-{file_index}", position=file_index)):
-        response = ds.invoke(
-            f"Rewrite the following text, output only the rewritten part without additional content, in English:{item['text']}"
-        )
-        res.append({
-            "text": response.content.strip(),
-            "result": "1"
-        })
-        
-        if (idx + 1) % 50 == 0:
-            with open(output_filename, 'w', encoding='utf-8') as f:
-                json.dump(res, f, ensure_ascii=False, indent=4)
-            print(f"[thread-{file_index}]: {idx + 1}")
-    
-    with open(output_filename, 'w', encoding='utf-8') as f:
-        json.dump(res, f, ensure_ascii=False, indent=4)
-    
-    print(f"[thread-{file_index}]: {len(res)} ")
-
-threads = []
-for i in range(10):
-    t = threading.Thread(target=process_file, args=(i,))
-    threads.append(t)
-    t.start()
-
-for t in threads:
-    t.join()
-
-
-
-import json
 import random
-import nltk
+
 from tqdm import tqdm
 
-try:
-    nltk.data.find('tokenizers/punkt')
-except LookupError:
-    nltk.download('punkt')
 
-def process_text(text_str, swap_threshold=20):
-
-    if not text_str:
-        return text_str
+def load_json(path):
+    with open(path, "r", encoding="utf-8") as stream:
+        data = json.load(stream)
+    if not isinstance(data, list):
+        raise ValueError("Expected a JSON array of records")
+    return data
 
 
-    lines = text_str.split('\n')
-    new_lines = []
-    
-    for line in lines:
-        line = line.strip()
-        if len(line) == 0:
-            new_lines.append(line)
-        else:
-
-            sents = nltk.sent_tokenize(line)
-            new_sents = []
-            for sent in sents:
-
-                if len(words) > swap_threshold:
-                    idx = random.randint(0, len(words) - 2)
-                    words[idx], words[idx+1] = words[idx+1], words[idx]
-                new_sents.append(' '.join(words))
-            new_lines.append(' '.join(new_sents))
-    
-    return '\n'.join(new_lines)
-
-def main():
-
-    input_file = ""      
-    output_file = ""    
-    swap_threshold = 20            
+def save_json(data, path):
+    output_dir = os.path.dirname(path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as stream:
+        json.dump(data, stream, ensure_ascii=False, indent=2)
 
 
-    print(f"read {input_file}...")
-    with open(input_file, 'r', encoding='utf-8') as f:
-        data = json.load(f)
-    
-    print(f"successfully {len(data)} datas")
+def rewrite_attack(data, model_name, base_url):
+    from langchain_openai import ChatOpenAI
+
+    api_key = os.getenv("DS_DEEPSEEK_API_KEY")
+    if not api_key:
+        raise RuntimeError("Set DS_DEEPSEEK_API_KEY before running rewrite mode")
+
+    client = ChatOpenAI(model=model_name, api_key=api_key, base_url=base_url)
+    output = []
+    for item in tqdm(data, desc="Rewrite attack"):
+        text = str(item.get("text", ""))
+        response = client.invoke(
+            "Rewrite the following English text while preserving its meaning. "
+            "Return only the rewritten text:\n\n" + text
+        )
+        updated = dict(item)
+        updated["text"] = response.content.strip()
+        output.append(updated)
+    return output
 
 
-    processed_data = []
-    
-    for item in tqdm(data, desc="Processing"):
-        text_val = item.get("text", "")
-        result_val = item.get("result", "") 
-        
+def decohere_text(text, swap_threshold, rng):
+    words = str(text).split()
+    if len(words) <= swap_threshold:
+        return str(text)
+    index = rng.randrange(len(words) - 1)
+    words[index], words[index + 1] = words[index + 1], words[index]
+    return " ".join(words)
 
-        new_text = process_text(text_val, swap_threshold)
-        
 
-        new_item = {
-            "text": new_text,
-            "result": result_val 
-        }
-        processed_data.append(new_item)
+def decoherence_attack(data, swap_threshold, seed):
+    rng = random.Random(seed)
+    output = []
+    for item in tqdm(data, desc="Decoherence attack"):
+        updated = dict(item)
+        updated["text"] = decohere_text(
+            item.get("text", ""), swap_threshold=swap_threshold, rng=rng
+        )
+        output.append(updated)
+    return output
 
-    with open(output_file, 'w', encoding='utf-8') as f:
-        json.dump(processed_data, f, ensure_ascii=False, indent=2)
-    
+
+def main(args):
+    data = load_json(args.input_path)
+    if args.mode == "rewrite":
+        output = rewrite_attack(data, args.model, args.base_url)
+    else:
+        output = decoherence_attack(data, args.swap_threshold, args.seed)
+    save_json(output, args.output_path)
+    print(f"Saved {len(output)} records to {args.output_path}")
+
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mode", choices=("rewrite", "decoherence"), required=True)
+    parser.add_argument("--input_path", required=True)
+    parser.add_argument("--output_path", required=True)
+    parser.add_argument("--model", default="deepseek-chat")
+    parser.add_argument("--base_url", default="https://api.deepseek.com")
+    parser.add_argument("--swap_threshold", type=int, default=20)
+    parser.add_argument("--seed", type=int, default=42)
+    main(parser.parse_args())

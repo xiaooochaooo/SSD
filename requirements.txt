@@ -1,0 +1,8 @@
+numpy
+torch
+torch-geometric
+transformers
+scikit-learn
+spacy
+tqdm
+langchain-openai
